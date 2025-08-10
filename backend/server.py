@@ -1,5 +1,6 @@
 
 import os
+print('ENVIRONMENT VARIABLES:', dict(os.environ))  # Debug print
 import base64
 import requests
 from flask import Flask, request, jsonify, send_from_directory
@@ -45,9 +46,16 @@ def call_openrouter(model, messages, temperature=0.3, max_tokens=500):
         "temperature": temperature,
         "max_tokens": max_tokens
     }
-    resp = requests.post(url, json=payload, headers=headers)
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"]
+    print(f"DEBUG: Using OpenRouter API key: {OPENROUTER_API_KEY!r}")
+    try:
+        resp = requests.post(url, json=payload, headers=headers)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"OpenRouter API error: {e}")
+        if resp is not None:
+            print(f"Response text: {getattr(resp, 'text', None)}")
+        raise
 
 @app.route("/analyze-food", methods=["POST"])
 def analyze_food():
@@ -103,9 +111,12 @@ def analyze_food():
     except RequestEntityTooLarge:
         return jsonify({"error": "Uploaded file is too large. Max: 5MB"}), 413
     except requests.exceptions.RequestException as e:
+        print("API request failed:", e)
         return jsonify({"error": "API request failed", "details": str(e)}), 500
     except Exception as e:
         print("Analysis failed:", e)
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": "Analysis failed", "details": str(e)}), 500
 
 # Serve React frontend in production
