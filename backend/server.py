@@ -1,75 +1,122 @@
-from fastapi import FastAPI, APIRouter
-from dotenv import load_dotenv
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
+
 import os
-import logging
-from pathlib import Path
-from pydantic import BaseModel, Field
-from typing import List
-import uuid
-from datetime import datetime
+import base64
+import requests
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from dotenv import load_dotenv
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 
+# Load environment variables
+load_dotenv()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+if not OPENROUTER_API_KEY:
+    raise RuntimeError("OPENROUTER_API_KEY is missing from .env file!")
 
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+# Flask app setup
+app = Flask(__name__, static_folder="../frontend/build", static_url_path="/")
+CORS(app, resources={r"/analyze-food": {"origins": "*"}})
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Config for file uploads
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5 MB
 
-# Create the main app without a prefix
-app = FastAPI()
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "webp"}
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Create a router with the /api prefix
-api_router = APIRouter(prefix="/api")
+# Prompt for LLaMA analysis
+ANALYSIS_PROMPT = """
+**IMPORTANT:**  
+1. **Start your response with:** "Rating: X/10" where X is the rating.  
 
+**Review the food label and consider the following:**
 
-# Define Models
-class StatusCheck(BaseModel):
-    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+**Recommendation:** Should the user eat this regularly, occasionally, or avoid it?
+"""
 
-class StatusCheckCreate(BaseModel):
-    client_name: str
+def call_openrouter(model, messages, temperature=0.3, max_tokens=500):
+    """Generic function to call OpenRouter API"""
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}"}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+    resp = requests.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"]
 
-# Add your routes to the router instead of directly to app
-@api_router.get("/")
-async def root():
-    return {"message": "Hello World"}
+@app.route("/analyze-food", methods=["POST"])
+def analyze_food():
+    try:
+        # Check file
+        if "image" not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+        
+        file = request.files["image"]
+        if file.filename == "":
+            return jsonify({"error": "No selected file"}), 400
+        
+        if not allowed_file(file.filename):
+            return jsonify({"error": "Unsupported file type. Only images allowed."}), 415
 
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
-    status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
-    return status_obj
+        # Read image as Base64
+        image_bytes = file.read()
+        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
 
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    status_checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**status_check) for status_check in status_checks]
+        # Step 1: Qwen2.5 VL extraction
+        extracted_text = call_openrouter(
+            model="qwen/qwen2.5-vl-72b-instruct:free",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Extract the food label details in a plain text format."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}}
+                    ]
+                }
+            ],
+            temperature=0.1,
+            max_tokens=2000
+        )
 
-# Include the router in the main app
-app.include_router(api_router)
+        # Step 2: LLaMA 3.3 rating
+        analysis_text = call_openrouter(
+            model="meta-llama/llama-3.3-70b-instruct:free",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"{ANALYSIS_PROMPT}\n\nFood Label Details:\n{extracted_text}"
+                }
+            ],
+            temperature=0.3,
+            max_tokens=500
+        )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        return jsonify({
+            "analysis": analysis_text
+        })
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+    except RequestEntityTooLarge:
+        return jsonify({"error": "Uploaded file is too large. Max: 5MB"}), 413
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "API request failed", "details": str(e)}), 500
+    except Exception as e:
+        print("Analysis failed:", e)
+        return jsonify({"error": "Analysis failed", "details": str(e)}), 500
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+# Serve React frontend in production
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    if path != "" and os.path.exists(os.path.join(app.static_folder, path)):
+        return send_from_directory(app.static_folder, path)
+    else:
+        return send_from_directory(app.static_folder, "index.html")
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
